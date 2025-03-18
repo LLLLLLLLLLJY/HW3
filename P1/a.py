@@ -1,62 +1,107 @@
 #!/usr/bin/env python
 
-import os
-from numpy import loadtxt, linspace, meshgrid
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from numpy import exp, dot, pi, inf, isclose, array, sum
+from scipy.linalg import cholesky, LinAlgError, solve_triangular, inv
+from scipy.integrate import nquad
 
-# (a) 生成 LDOS 热力图
-def generate_heatmap(file_path):
-    data = loadtxt(file_path)
-    plt.imshow(data, cmap='hot', origin='lower')
-    plt.colorbar(label='LDOS Intensity')
-    plt.title(f"LDOS Heatmap: {os.path.basename(file_path)}")
+# a
+def integral_function(vec, mat, vec_w, power=0):
+	vec = array(vec)
+	return exp(-dot(vec, dot(mat, vec))/2 + dot(vec, vec_w)) * (vec**power).prod()
 
-    output_path = os.path.splitext(file_path)[0] + "_heatmap.png"
-    plt.savefig(output_path)
-    plt.close()
+# Using Cholesky decomposition is a bit faster than using inv directly.
+def analytical_integral(mat, vec_w):
+	chol_mat = cholesky(mat, lower=True)
+	det_chol_mat = chol_mat.diagonal().prod()
+	inv_chol_vec_w = solve_triangular(chol_mat, vec_w, lower=True)
+	return (2*pi)**(len(vec_w)/2)/det_chol_mat*exp(dot(inv_chol_vec_w, inv_chol_vec_w)/2)
 
-# (b) 生成 LDOS 3D 表面图
-def generate_3d_surface(file_path):
-    data = loadtxt(file_path)
-    x = linspace(0, data.shape[1], data.shape[1])
-    y = linspace(0, data.shape[0], data.shape[0])
-    X, Y = meshgrid(x, y)
+def numerical_integral(mat, vec_w):
+	return nquad(
+		lambda *args: integral_function(args[:-2], *args[-2:]),
+		[(-inf, inf)]*len(vec_w),
+		args=(mat, vec_w)
+	)[0]
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.plot_surface(X, Y, data, cmap='viridis')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('LDOS Intensity')
-    ax.set_title(f"LDOS 3D Surface: {os.path.basename(file_path)}")
+def validate_integral(mat, vec_w):
+	try:
+		expected = analytical_integral(mat, vec_w)
+		computed = numerical_integral(mat, vec_w)
+	except LinAlgError:
+		print("error: not positive definite")
+		return
+	if isclose(expected, computed):
+		print("pass")
+	else:
+		print(f"fail: analytic {expected}, numerical {computed}")
 
-    output_path = os.path.splitext(file_path)[0] + "_3d_surface.png"
-    plt.savefig(output_path)
-    plt.close()
+# b
+MATRIX_A = [[4,2,1],[2,5,3],[1,3,6]]
+VECTOR_W = [1,2,3]
+validate_integral(MATRIX_A, VECTOR_W) # correct
+validate_integral([[4,2,1],[2,1,3],[1,3,6]], VECTOR_W) # not positive definite
 
-# (c) 局部区域 LDOS 分析
-def analyze_local_region(file_path, region):
-    data = loadtxt(file_path)
-    x_start, x_end, y_start, y_end = region
-    local_ldos = data[y_start:y_end, x_start:x_end]
+# c
+# len(variables) must be even number.
+# For each possible way of pairing elements in variables,
+# multiply the corresponding elements in cov_matrix.
+# Then sum all the products.
+def pairwise_product(cov_matrix, variables):
+	order = len(variables)
+	if order == 0:
+		return 1
+	result = 0
+	for i in range(1, order):
+		result += cov_matrix[variables[0], variables[i]] * pairwise_product(cov_matrix, variables[1:i] + variables[i+1:])
+	return result
 
-    avg_ldos = local_ldos.mean(axis=1)
-    plt.plot(range(y_start, y_end), avg_ldos)
-    plt.xlabel('Position')
-    plt.ylabel('Average LDOS')
-    plt.title(f"Local LDOS Analysis: {os.path.basename(file_path)}")
+# Compute moments for multivariate normal distribution with covariance cov_matrix and mean mean_vector
+def wick_theorem(cov_matrix, mean_vector, variables, shifted=None):
+	num_vars = len(variables)
+	if num_vars == 0:
+		return 1
+	if shifted is None:
+		shifted = [False]*num_vars
+	result = 0
+	for i in range(num_vars):
+		if shifted[i]:
+			continue
+		shifted[i] = True
+		result += mean_vector[variables[i]] * wick_theorem(cov_matrix, mean_vector, variables[:i] + variables[i+1:], shifted[:i] + shifted[i+1:])
+	if num_vars % 2 == 0 and all(shifted):
+		result += pairwise_product(cov_matrix, variables)
+	return result
 
-    output_path = os.path.splitext(file_path)[0] + "_local_analysis.png"
-    plt.savefig(output_path)
-    plt.close()
+def analytical_moment(mat, vec_w, power_vec):
+	cov_matrix = inv(mat)
+	variables = []
+	for idx, p in enumerate(power_vec):
+		variables += [idx]*p
+	return wick_theorem(cov_matrix, dot(cov_matrix, vec_w), variables)
 
-# 处理 `P2` 目录中的所有 .txt 文件
-script_dir = os.path.dirname(os.path.abspath(__file__))
+def numerical_moment(mat, vec_w, power_vec):
+	return nquad(
+		lambda *args: integral_function(args[:-3], *args[-3:]),
+		[(-inf, inf)]*len(vec_w),
+		args=(mat, vec_w, power_vec)
+	)[0] / numerical_integral(mat, vec_w)
 
-for file in os.listdir(script_dir):
-    if file.endswith(".txt"):
-        file_path = os.path.join(script_dir, file)
-        generate_heatmap(file_path)
-        generate_3d_surface(file_path)
-        analyze_local_region(file_path, (10, 30, 10, 30))
+def validate_moment(mat, vec_w, power_vec):
+	expected = analytical_moment(mat, vec_w, power_vec)
+	computed = numerical_moment(mat, vec_w, power_vec)
+	if isclose(expected, computed):
+		print("pass")
+	else:
+		print(f"fail: analytic {expected}, numerical {computed}")
+
+# Validation for various moments
+validate_moment(MATRIX_A, VECTOR_W, [1,0,0]) # mu1
+validate_moment(MATRIX_A, VECTOR_W, [0,1,0]) # mu2
+validate_moment(MATRIX_A, VECTOR_W, [0,0,1]) # mu3
+validate_moment(MATRIX_A, VECTOR_W, [1,1,0]) # S12 + mu1 mu2
+validate_moment(MATRIX_A, VECTOR_W, [0,1,1]) # S23 + mu2 mu3
+validate_moment(MATRIX_A, VECTOR_W, [1,0,1]) # S13 + mu1 mu3
+validate_moment(MATRIX_A, VECTOR_W, [2,1,0]) # 2 mu1 S12 + mu2 S11 + mu1^2 mu2
+validate_moment(MATRIX_A, VECTOR_W, [0,1,2]) # 2 mu3 S23 + mu2 S33 + mu2 mu3^3
+validate_moment(MATRIX_A, VECTOR_W, [2,2,0]) # (S11 + mu1^2) (S22 + mu2^2) + 2 S12^2
+validate_moment(MATRIX_A, VECTOR_W, [0,2,2]) # (S22 + mu2^2) (S33 + mu3^2) + 2 S23^2
